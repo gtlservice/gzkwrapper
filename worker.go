@@ -11,6 +11,7 @@
 package gzkwrapper
 
 import "github.com/gtlservice/gutils/network"
+import "github.com/samuel/go-zookeeper/zk"
 
 import (
 	"errors"
@@ -29,8 +30,6 @@ type WorkerArgs struct {
 	Pulse     string
 	Threshold int
 }
-
-var worker *Worker
 
 type Worker struct {
 	Key     string
@@ -69,7 +68,7 @@ func NewWorker(key string, args *WorkerArgs, handler INodeNotifyHandler) (*Worke
 		return nil, err
 	}
 
-	worker = &Worker{
+	return &Worker{
 		Key:     key,
 		Root:    args.Root,
 		Path:    args.Root + "/WORKER-" + key,
@@ -79,8 +78,7 @@ func NewWorker(key string, args *WorkerArgs, handler INodeNotifyHandler) (*Worke
 		Handler: handler,
 		Quit:    make(chan bool),
 		Alive:   false,
-	}
-	return worker, nil
+	}, nil
 }
 
 func (w *Worker) Open() error {
@@ -156,7 +154,7 @@ func (w *Worker) Create(path string, buffer []byte) error {
 
 func (w *Worker) Remove(path string) error {
 
-	return worker.Node.Remove(path)
+	return w.Node.Remove(path)
 }
 
 func (w *Worker) Set(path string, buffer []byte) error {
@@ -164,7 +162,7 @@ func (w *Worker) Set(path string, buffer []byte) error {
 	return w.Node.Set(path, buffer)
 }
 
-func (w *Worker) SetAttach(attach interface{}) {
+func (w *Worker) SetAttach(attach []byte) {
 
 	w.Data.Attach = attach
 }
@@ -237,14 +235,22 @@ NEW_TICK_DURATION:
 		case <-ticker.C: //node心跳
 			{
 				ticker.Stop()
-				ret, err := w.Node.Exists(w.Path)
-				if err != nil || !ret {
-					err = errors.New("pulse keepalive invaild...")
-				} else { //节点还存在则发送心跳
-					w.Data.Singin = true
-					w.Data.Timestamp = time.Now().Unix()
-					if buffer, err := encode(w.Data); err == nil {
-						w.Node.Set(w.Path, buffer)
+				w.Data.Singin = true
+				w.Data.Timestamp = time.Now().Unix()
+				buffer, err := encode(w.Data)
+				if err != nil {
+					err = errors.New("encode worker pulse data error, " + err.Error())
+					w.Handler.OnZkWrapperPulseHandlerFunc(w.Key, w.Data, err)
+					goto NEW_TICK_DURATION
+				}
+				err = w.Node.Set(w.Path, buffer)
+				if err != nil {
+					if err == zk.ErrNoNode {
+						if er := w.Node.Create(w.Path, buffer); er != nil {
+							err = errors.New("create worker error, " + er.Error())
+						}
+					} else {
+						err = errors.New("set worker error, " + err.Error())
 					}
 				}
 				w.Handler.OnZkWrapperPulseHandlerFunc(w.Key, w.Data, err)

@@ -31,14 +31,6 @@ type ServerArgs struct {
 	Threshold int
 }
 
-var server *Server
-var refcache *NodeMapper
-var suspicioncache *SuspicionMapper
-var waitgroup sync.WaitGroup
-
-var online = make([]*NodeInfo, 0)
-var offline = make([]*NodeInfo, 0)
-
 type Server struct {
 	Key        string
 	Root       string
@@ -47,6 +39,8 @@ type Server struct {
 	Node       *Node
 	Data       *NodeData
 	Cache      *NodeMapper
+	refcache   *NodeMapper
+	Blacklist  *SuspicionMapper
 	Handler    INodeNotifyHandler
 	Quit       chan bool
 }
@@ -80,11 +74,9 @@ func NewServer(key string, args *ServerArgs, handler INodeNotifyHandler) (*Serve
 	if err != nil {
 		return nil, err
 	}
-	timeoutsec := timeout.Seconds() * float64(args.Threshold) //超时时长*阀值
 
-	refcache = NewNodeMapper()
-	suspicioncache = NewSuspicionMapper()
-	server = &Server{
+	timeoutsec := timeout.Seconds() * float64(args.Threshold) //超时时长*阀值
+	return &Server{
 		Key:        key,
 		Root:       args.Root,
 		Pulse:      pulse,
@@ -92,10 +84,11 @@ func NewServer(key string, args *ServerArgs, handler INodeNotifyHandler) (*Serve
 		Node:       NewNode(args.Hosts, handler.OnZkWrapperWatchHandlerFunc),
 		Data:       NewNodeData(NODE_SERVER, hostname, args.Location, args.OS, args.Platform, addr.IP, os.Getpid()),
 		Cache:      NewNodeMapper(),
+		refcache:   NewNodeMapper(),
+		Blacklist:  NewSuspicionMapper(),
 		Handler:    handler,
 		Quit:       make(chan bool),
-	}
-	return server, nil
+	}, nil
 }
 
 func (s *Server) Open() error {
@@ -119,11 +112,11 @@ func (s *Server) Open() error {
 
 func (s *Server) Close() error {
 
-	refcache.Clear()
-	suspicioncache.Clear()
 	if s.Node != nil {
 		s.Quit <- true
 		close(s.Quit)
+		s.refcache.Clear()
+		s.Blacklist.Clear()
 		s.Node.Close()
 		s.Cache.Clear()
 		return nil
@@ -183,15 +176,17 @@ func (s *Server) Set(path string, buffer []byte) error {
 
 func (s *Server) RefreshCache() error {
 
-	//更新本地refcache
-	if err := pullRefCache(); err != nil {
+	if err := s.pullRefCache(); err != nil { //更新本地refcache
 		return err
 	}
 
+	var waitgroup sync.WaitGroup
+	var online = make([]*NodeInfo, 0)
+	var offline = make([]*NodeInfo, 0)
 	lockeys := s.Cache.GetKeys()
 	for i := len(lockeys) - 1; i >= 0; i-- {
 		key := lockeys[i]
-		if ret := refcache.Contains(key); !ret {
+		if ret := s.refcache.Contains(key); !ret {
 			waitgroup.Add(1)
 			go func(k string) {
 				s.Node.Remove(s.Root + "/WORKER-" + k)
@@ -199,7 +194,7 @@ func (s *Server) RefreshCache() error {
 			}(key)
 			offline = append(offline, &NodeInfo{Key: key, Data: s.Cache.Get(key)})
 			s.Cache.Remove(key)
-			suspicioncache.Del(key) //删除怀疑列表
+			s.Blacklist.Del(key)
 			lockeys = s.Cache.GetKeys()
 		}
 	}
@@ -211,18 +206,18 @@ func (s *Server) RefreshCache() error {
 		temp_keys = append(temp_keys, key)
 	}
 
-	refkeys := refcache.GetKeys()
+	refkeys := s.refcache.GetKeys()
 	for _, key := range refkeys { //合并到本地Cache
-		refvalue := refcache.Get(key)
+		refvalue := s.refcache.Get(key)
 		if locvalue := s.Cache.Get(key); locvalue == nil {
 			s.Cache.Append(key, refvalue)
 		} else {
 			if refvalue.Timestamp == locvalue.Timestamp {
-				suspicioncache.Add(key) //加入怀疑列表
+				s.Blacklist.Add(key)
 			} else {
-				suspicioncache.Del(key) //删除怀疑列表
+				s.Blacklist.Del(key)
 			}
-			s.Cache.Set(key, refcache.Get(key))
+			s.Cache.Set(key, s.refcache.Get(key))
 		}
 	}
 
@@ -231,7 +226,7 @@ func (s *Server) RefreshCache() error {
 	for i := len(lockeys) - 1; i >= 0; i-- {
 		key := lockeys[i]
 		value := s.Cache.Get(key)
-		if !value.Singin || checkTimeout(key, timestamp) { //删除本地退出或异常节点
+		if !value.Singin || s.checkTimeout(key, timestamp) { //删除本地退出或异常节点
 			waitgroup.Add(1)
 			go func(k string) {
 				s.Node.Remove(s.Root + "/WORKER-" + k)
@@ -239,7 +234,7 @@ func (s *Server) RefreshCache() error {
 			}(key)
 			offline = append(offline, &NodeInfo{Key: key, Data: s.Cache.Get(key)})
 			s.Cache.Remove(key)
-			suspicioncache.Del(key) //删除怀疑列表
+			s.Blacklist.Del(key)
 			lockeys = s.Cache.GetKeys()
 		}
 	}
@@ -265,26 +260,28 @@ func (s *Server) RefreshCache() error {
 		online = online[0:0]
 		offline = offline[0:0]
 	}
+	s.refcache.Clear()
 	return nil
 }
 
-func pullRefCache() error {
+func (s *Server) pullRefCache() error {
 
-	refcache.Clear()
-	keys, err := server.Node.Children(server.Root)
+	s.refcache.Clear()
+	keys, err := s.Node.Children(s.Root)
 	if err != nil {
 		return err
 	}
 
+	var waitgroup sync.WaitGroup
 	for i := 0; i < len(keys); i++ {
 		if !strings.HasPrefix(keys[i], "WORKER-") {
 			continue
 		}
 		waitgroup.Add(1)
 		go func(key string) { //根据节点名称获取节点数据并筛选WORKER类型节点
-			if buffer, err := server.Node.Get(server.Root + "/" + key); err == nil {
+			if buffer, err := s.Node.Get(s.Root + "/" + key); err == nil {
 				if value, err := decode(buffer); err == nil && value.NodeType == NODE_WORKER {
-					refcache.Append(strings.TrimPrefix(key, "WORKER-"), value)
+					s.refcache.Append(strings.TrimPrefix(key, "WORKER-"), value)
 				}
 			}
 			waitgroup.Done()
@@ -294,9 +291,9 @@ func pullRefCache() error {
 	return nil
 }
 
-func checkTimeout(key string, timestamp int64) bool {
+func (s *Server) checkTimeout(key string, timestamp int64) bool {
 
-	jointimestamp := suspicioncache.Get(key)
+	jointimestamp := s.Blacklist.Get(key)
 	if jointimestamp == 0 {
 		return false
 	}
@@ -304,7 +301,7 @@ func checkTimeout(key string, timestamp int64) bool {
 	seedt := time.Unix(timestamp, 0)
 	nodet := time.Unix(jointimestamp, 0)
 	diffsec := seedt.Sub(nodet).Seconds()
-	if diffsec < server.TimeoutSec {
+	if diffsec < s.TimeoutSec {
 		return false
 	}
 	return true

@@ -38,9 +38,8 @@ func (t NodeType) String() string {
 		return "NODE_SERVER"
 	case NODE_WORKER:
 		return "NODE_WORKER"
-	default:
-		return "Unknown"
 	}
+	return ""
 }
 
 var buffer_pool = sync.Pool{
